@@ -1,7 +1,7 @@
 # SCDRL  
 **Semi-Supervised Disentangled Representation Learning for Single-Cell RNA Sequencing Data**
 
-[View the figure (PDF)](./SCDRL.pdf)
+![Figure description](./SCDRL.png)
 
 ## Setting Up  
 To get started, create a conda environment for **SCDRL** by following the instructions in [`conda/SCDRL_conda.sh`](./conda/SCDRL_conda.sh).
