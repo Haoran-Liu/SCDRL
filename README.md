@@ -14,13 +14,12 @@ Before running SCDRL, update the file paths in `SCDRL.py` to match your local di
 ## Running SCDRL  
 To run the model, use the following command:
 
-
 ```bash
 python SCDRL.py \
     --seed 42 \
     --percentage 0.05
 ```
 
-
 --seed: Random seed for reproducibility.
+
 --percentage: Fraction of labeled data used for semi-supervised training (e.g., 0.05 for 5%).
