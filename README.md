@@ -20,6 +20,5 @@ python SCDRL.py \
     --percentage 0.05
 ```
 
-Below are the configurable parameters for SCDRL.py:
-	•	--seed: Random seed for reproducibility.
-	•	--percentage: Fraction of labeled data used for semi-supervised training (e.g., 0.05 for 5%).
+--seed: Random seed for reproducibility.
+--percentage: Fraction of labeled data used for semi-supervised training (e.g., 0.05 for 5%).
