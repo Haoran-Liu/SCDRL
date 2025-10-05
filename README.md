@@ -20,6 +20,6 @@ python SCDRL.py \
     --percentage 0.05
 ```
 
---seed: Random seed for reproducibility.
 
+--seed: Random seed for reproducibility.
 --percentage: Fraction of labeled data used for semi-supervised training (e.g., 0.05 for 5%).
