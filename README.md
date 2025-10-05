@@ -18,6 +18,7 @@ To run the model, use the following command:
 python SCDRL.py \
     --seed 42 \
     --percentage 0.05
+```
 
 Below are the configurable parameters for SCDRL.py:
 	•	--seed: Random seed for reproducibility.
