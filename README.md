@@ -21,9 +21,7 @@ The output is another `.npz` file that stores the performance metrics and predic
 To run the model, use the following command:
 
 ```bash
-python SCDRL.py \
-    --seed 42 \
-    --percentage 0.05
+python SCDRL.py --seed 42 --percentage 0.05
 ```
 
 --seed: Random seed for reproducibility.
