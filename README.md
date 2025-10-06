@@ -15,6 +15,7 @@ Before running SCDRL, update the file paths in `SCDRL.py` to match your local di
 
 The input to **SCDRL** is a `.npz` file containing the raw count matrix and ground-truth factor (attribute) annotations.  
 Please refer to the provided simulation data in the [`SCDRL_data`](./SCDRL_data) folder for examples.  
+
 The output is another `.npz` file that stores the performance metrics and predictions for unlabeled data produced by SCDRL.
 
 ## Running SCDRL  
