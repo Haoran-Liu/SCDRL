@@ -21,109 +21,132 @@ from utils import CustomDataset
 
 from SCDRL_evaluation import dci, sap, mig, classifier
 
+
 class MultiFactorClassifier(nn.Module):
 
     def __init__(self, config):
         super().__init__()
 
-        self.base_encoder = ConvEncoder(img_shape=config['img_shape'], max_conv_dim=128)
-        self.heads = nn.ModuleList([
-            nn.Linear(in_features=128, out_features=config['factor_sizes'][f])
-            for f in range(config['n_factors'])
-        ])
+        self.base_encoder = ConvEncoder(img_shape=config["img_shape"], max_conv_dim=128)
+        self.heads = nn.ModuleList(
+            [
+                nn.Linear(in_features=128, out_features=config["factor_sizes"][f])
+                for f in range(config["n_factors"])
+            ]
+        )
 
     def forward(self, img):
         x = self.base_encoder(img).reshape(img.shape[0], -1)
         return [head(x) for head in self.heads]
 
+
 class FactorModel(nn.Module):
-    
+
     def __init__(self, config):
         super().__init__()
-        
+
         self.config = config
-        
-        self.factor_embeddings = nn.ModuleList([
-            nn.Embedding(
-                num_embeddings=config['factor_sizes'][f],
-                embedding_dim=config['factor_dim'],
-                _weight=(2 * torch.rand(config['factor_sizes'][f], config['factor_dim']) - 1) * 0.05
+
+        self.factor_embeddings = nn.ModuleList(
+            [
+                nn.Embedding(
+                    num_embeddings=config["factor_sizes"][f],
+                    embedding_dim=config["factor_dim"],
+                    _weight=(
+                        2 * torch.rand(config["factor_sizes"][f], config["factor_dim"])
+                        - 1
+                    )
+                    * 0.05,
+                )
+                for f in range(config["n_factors"])
+            ]
+        )
+
+        if config["arch_betavae"]:
+            self.factor_classifiers = nn.ModuleList(
+                [
+                    BetaVAEEncoder(
+                        n_genes=config["n_genes"], latent_dim=config["factor_sizes"][f]
+                    )
+                    for f in range(config["n_factors"])
+                ]
             )
-            for f in range(config['n_factors'])
-        ])
-        
-        if config['arch_betavae']:
-            self.factor_classifiers = nn.ModuleList([
-                BetaVAEEncoder(n_genes=config['n_genes'], latent_dim=config['factor_sizes'][f])
-                for f in range(config['n_factors'])
-            ])
-        
+
         else:
             self.factor_classifiers = MultiFactorClassifier(config)
-    
+
     def forward(self, data, factors=None, label_masks=None):
         out = dict()
-        
+
         factor_codes = []
         assignment_entropy = []
-        
+
         if isinstance(self.factor_classifiers, MultiFactorClassifier):
             logits = self.factor_classifiers(data)
         else:
-            logits = [factor_classifier(data) for factor_classifier in self.factor_classifiers]
-        
-        for f in range(self.config['n_factors']):
+            logits = [
+                factor_classifier(data) for factor_classifier in self.factor_classifiers
+            ]
+
+        for f in range(self.config["n_factors"]):
             assignment = Categorical(logits=logits[f])
-            
+
             with torch.no_grad():
-                factor_values = torch.arange(self.config['factor_sizes'][f], dtype=torch.int64).to(data.device)
+                factor_values = torch.arange(
+                    self.config["factor_sizes"][f], dtype=torch.int64
+                ).to(data.device)
                 factor_embeddings = self.factor_embeddings[f](factor_values)
-            
+
             if factors is not None:
-                factor_code = (
-                    self.factor_embeddings[f](factors[:, f]) * label_masks[:, [f]]
-                    + torch.matmul(assignment.probs, factor_embeddings) * (~label_masks[:, [f]])
+                factor_code = self.factor_embeddings[f](factors[:, f]) * label_masks[
+                    :, [f]
+                ] + torch.matmul(assignment.probs, factor_embeddings) * (
+                    ~label_masks[:, [f]]
                 )
-            
+
             else:
                 factor_code = torch.matmul(assignment.probs, factor_embeddings)
-            
+
             factor_codes.append(factor_code)
             assignment_entropy.append(assignment.entropy())
-            out['assignment_logits_{}'.format(f)] = assignment.logits
-        
-        out['factor_codes'] = torch.cat(factor_codes, dim=1)
-        out['assignment_entropy'] = torch.stack(assignment_entropy, dim=1)
-        
+            out["assignment_logits_{}".format(f)] = assignment.logits
+
+        out["factor_codes"] = torch.cat(factor_codes, dim=1)
+        out["assignment_entropy"] = torch.stack(assignment_entropy, dim=1)
+
         return out
 
+
 class LatentModel(nn.Module):
-    
+
     def __init__(self, config):
         super().__init__()
-        
+
         self.config = config
-        
+
         self.factor_model = FactorModel(config)
-        
+
         self.residual_embeddings = nn.Embedding(
-            num_embeddings=config['n_samples'],
-            embedding_dim=config['residual_dim'],
-            _weight=(2 * torch.rand(config['n_samples'], config['residual_dim']) - 1) * 0.05
+            num_embeddings=config["n_samples"],
+            embedding_dim=config["residual_dim"],
+            _weight=(2 * torch.rand(config["n_samples"], config["residual_dim"]) - 1)
+            * 0.05,
         )
-        
-        if config['arch_betavae']:
+
+        if config["arch_betavae"]:
             self.generator = BetaVAEGenerator(
-                latent_dim=config['n_factors'] * config['factor_dim'] + config['residual_dim'],
-                n_genes=config['n_genes']
+                latent_dim=config["n_factors"] * config["factor_dim"]
+                + config["residual_dim"],
+                n_genes=config["n_genes"],
             )
-        
+
         else:
             self.generator = StyleGenerator(
-                latent_dim=config['n_factors'] * config['factor_dim'] + config['residual_dim'],
-                img_size=config['img_shape'][0]
+                latent_dim=config["n_factors"] * config["factor_dim"]
+                + config["residual_dim"],
+                img_size=config["img_shape"][0],
             )
-        
+
         self.factor_model = torch.nn.DataParallel(self.factor_model)
         self.residual_embeddings = torch.nn.DataParallel(self.residual_embeddings)
         self.generator = torch.nn.DataParallel(self.generator)
@@ -138,254 +161,485 @@ class AmortizedModel(nn.Module):
 
         self.factor_model = FactorModel(config)
 
-        if config['arch_betavae']:
-            self.residual_encoder = BetaVAEEncoder(n_genes=config['n_genes'], latent_dim=config['residual_dim'])
+        if config["arch_betavae"]:
+            self.residual_encoder = BetaVAEEncoder(
+                n_genes=config["n_genes"], latent_dim=config["residual_dim"]
+            )
             self.generator = BetaVAEGenerator(
-                latent_dim=config['n_factors'] * config['factor_dim'] + config['residual_dim'],
-                n_genes=config['n_genes']
+                latent_dim=config["n_factors"] * config["factor_dim"]
+                + config["residual_dim"],
+                n_genes=config["n_genes"],
             )
 
         else:
-            self.residual_encoder = ResidualEncoder(img_size=config['img_shape'][0], latent_dim=config['residual_dim'])
+            self.residual_encoder = ResidualEncoder(
+                img_size=config["img_shape"][0], latent_dim=config["residual_dim"]
+            )
             self.generator = StyleGenerator(
-                latent_dim=config['n_factors'] * config['factor_dim'] + config['residual_dim'],
-                img_size=config['img_shape'][0]
+                latent_dim=config["n_factors"] * config["factor_dim"]
+                + config["residual_dim"],
+                img_size=config["img_shape"][0],
             )
 
         self.factor_model = torch.nn.DataParallel(self.factor_model)
         self.residual_encoder = torch.nn.DataParallel(self.residual_encoder)
         self.generator = torch.nn.DataParallel(self.generator)
 
-        if self.config['synthesis']['adversarial']:
-            self.discriminator = Discriminator(size=config['img_shape'][0])
+        if self.config["synthesis"]["adversarial"]:
+            self.discriminator = Discriminator(size=config["img_shape"][0])
             self.discriminator = torch.nn.DataParallel(self.discriminator)
 
 
 class Model:
-    
+
     def __init__(self, config):
         super().__init__()
-        
+
         self.config = config
-        
-        self.device = torch.device("cuda" if torch.cuda.is_available() else
-                                    "mps" if torch.backends.mps.is_available() else
-                                    "cpu")
-        torch.manual_seed(seed=config['seed'])
-        
+
+        self.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+        torch.manual_seed(seed=config["seed"])
+
         self.latent_model = None
         self.amortized_model = None
-        
-        if config['loss_reconstruction'] == 'bce':
+
+        if config["loss_reconstruction"] == "bce":
             self.reconstruction_loss = nn.BCELoss()
-        elif config['loss_reconstruction'] == 'l1':
+        elif config["loss_reconstruction"] == "l1":
             self.reconstruction_loss = nn.L1Loss()
-        elif config['loss_reconstruction'] == 'mse':
+        elif config["loss_reconstruction"] == "mse":
             self.reconstruction_loss = nn.MSELoss()
-        elif config['loss_reconstruction'] == 'perceptual':
-            self.reconstruction_loss = VGGDistance(layer_ids=config['perceptual_loss'])
+        elif config["loss_reconstruction"] == "perceptual":
+            self.reconstruction_loss = VGGDistance(layer_ids=config["perceptual_loss"])
         else:
-            raise Exception('unsupported reconstruction loss')
-        
+            raise Exception("unsupported reconstruction loss")
+
         self.classification_loss = nn.CrossEntropyLoss()
-        self.visualization_rs = np.random.RandomState(seed=config['seed'])
-    
+        self.visualization_rs = np.random.RandomState(seed=config["seed"])
+
     @staticmethod
     def load(model_dir):
-        with open(os.path.join(model_dir, 'config.pkl'), 'rb') as config_fd:
+        with open(os.path.join(model_dir, "config.pkl"), "rb") as config_fd:
             config = pickle.load(config_fd)
-        
+
         model = Model(config)
-        
-        if os.path.exists(os.path.join(model_dir, 'latent.pth')):
+
+        if os.path.exists(os.path.join(model_dir, "latent.pth")):
             model.latent_model = LatentModel(config)
-            model.latent_model.load_state_dict(torch.load(os.path.join(model_dir, 'latent.pth')))
-        
-        if os.path.exists(os.path.join(model_dir, 'amortized.pth')):
+            model.latent_model.load_state_dict(
+                torch.load(os.path.join(model_dir, "latent.pth"))
+            )
+
+        if os.path.exists(os.path.join(model_dir, "amortized.pth")):
             model.amortized_model = AmortizedModel(config)
-            model.amortized_model.load_state_dict(torch.load(os.path.join(model_dir, 'amortized.pth')))
-        
+            model.amortized_model.load_state_dict(
+                torch.load(os.path.join(model_dir, "amortized.pth"))
+            )
+
         return model
-    
+
     def save(self, model_dir):
         if not os.path.exists(model_dir):
             os.mkdir(model_dir)
-        
-        with open(os.path.join(model_dir, 'config.pkl'), 'wb') as config_fd:
+
+        with open(os.path.join(model_dir, "config.pkl"), "wb") as config_fd:
             pickle.dump(self.config, config_fd)
-        
+
         if self.latent_model:
-            torch.save(self.latent_model.state_dict(), os.path.join(model_dir, 'latent.pth'))
-        
+            torch.save(
+                self.latent_model.state_dict(), os.path.join(model_dir, "latent.pth")
+            )
+
         if self.amortized_model:
-            torch.save(self.amortized_model.state_dict(), os.path.join(model_dir, 'amortized.pth'))
-    
-    def train_latent_model(self, counts_norm, factors, label_masks, model_dir, tensorboard_dir):
+            torch.save(
+                self.amortized_model.state_dict(),
+                os.path.join(model_dir, "amortized.pth"),
+            )
+
+    def train_latent_model(
+        self, counts_norm, factors, label_masks, model_dir, tensorboard_dir
+    ):
         self.latent_model = LatentModel(self.config)
-        
-        data = dict(
-            counts_norm=torch.from_numpy(counts_norm).to(torch.float32),
-            counts_norm_id=torch.from_numpy(np.arange(counts_norm.shape[0])),
-            factors=torch.from_numpy(factors.astype(np.int64)),
-            label_masks=torch.from_numpy(label_masks.astype(bool))
+
+        train_cfg = self.config.get("train", {})
+        val_split = float(train_cfg.get("val_split", 0.0) or 0.0)
+        es_cfg = train_cfg.get("early_stopping", {}) or {}
+        early_stopping_enabled = bool(es_cfg.get("enabled", False))
+        early_stopping_patience = int(es_cfg.get("patience", 10))
+        early_stopping_min_delta = float(es_cfg.get("min_delta", 0.0))
+
+        n_samples_total = counts_norm.shape[0]
+        indices = np.arange(n_samples_total)
+        rng = np.random.RandomState(seed=self.config["seed"])
+        rng.shuffle(indices)
+
+        n_val = int(n_samples_total * val_split)
+        if early_stopping_enabled and n_val == 0:
+            # Keep early stopping working without a validation split.
+            n_val = 0
+
+        val_idx = indices[:n_val]
+        train_idx = indices[n_val:]
+
+        data_train = dict(
+            counts_norm=torch.from_numpy(counts_norm[train_idx]).to(torch.float32),
+            counts_norm_id=torch.from_numpy(train_idx),
+            factors=torch.from_numpy(factors[train_idx].astype(np.int64)),
+            label_masks=torch.from_numpy(label_masks[train_idx].astype(bool)),
         )
-        
-        dataset = CustomDataset(data)
+
+        data_val = None
+        if n_val > 0:
+            data_val = dict(
+                counts_norm=torch.from_numpy(counts_norm[val_idx]).to(torch.float32),
+                counts_norm_id=torch.from_numpy(val_idx),
+                factors=torch.from_numpy(factors[val_idx].astype(np.int64)),
+                label_masks=torch.from_numpy(label_masks[val_idx].astype(bool)),
+            )
+
+        dataset = CustomDataset(data_train)
         data_loader = DataLoader(
-            dataset, batch_size=self.config['train']['batch_size'],
-            shuffle=True, pin_memory=True, drop_last=False
+            dataset,
+            batch_size=self.config["train"]["batch_size"],
+            shuffle=True,
+            pin_memory=True,
+            drop_last=False,
         )
-        
-        label_ids = np.sum(label_masks, axis=1) > 0
-        dataset_labeled = CustomDataset({name: tensor[label_ids] for name, tensor in data.items()})
-        data_loader_labeled = DataLoader(
-            dataset_labeled, batch_size=self.config['train']['batch_size'],
-            shuffle=True, pin_memory=True, drop_last=False
+
+        label_ids = (torch.sum(data_train["label_masks"], dim=1) > 0).cpu().numpy()
+        dataset_labeled = CustomDataset(
+            {name: tensor[label_ids] for name, tensor in data_train.items()}
         )
-        
-        optimizer = Adam([
-            {
-                'params': itertools.chain(
-                    self.latent_model.factor_model.module.factor_embeddings.parameters(),
-                    self.latent_model.residual_embeddings.parameters()
-                ),
-                'lr': self.config['train']['learning_rate']['latent']
-            },
-            {
-                'params': self.latent_model.factor_model.module.factor_classifiers.parameters(),
-                'lr': self.config['train']['learning_rate']['classifier']
-            },
-            {
-                'params': self.latent_model.generator.parameters(),
-                'lr': self.config['train']['learning_rate']['generator']
-            }
-        ], betas=(0.5, 0.999))
-        
+        data_loader_labeled = None
+        if len(dataset_labeled) > 0:
+            data_loader_labeled = DataLoader(
+                dataset_labeled,
+                batch_size=self.config["train"]["batch_size"],
+                shuffle=True,
+                pin_memory=True,
+                drop_last=False,
+            )
+
+        data_loader_val = None
+        if data_val is not None:
+            dataset_val = CustomDataset(data_val)
+            data_loader_val = DataLoader(
+                dataset_val,
+                batch_size=self.config["train"]["batch_size"],
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+            )
+
+        optimizer = Adam(
+            [
+                {
+                    "params": itertools.chain(
+                        self.latent_model.factor_model.module.factor_embeddings.parameters(),
+                        self.latent_model.residual_embeddings.parameters(),
+                    ),
+                    "lr": self.config["train"]["learning_rate"]["latent"],
+                },
+                {
+                    "params": self.latent_model.factor_model.module.factor_classifiers.parameters(),
+                    "lr": self.config["train"]["learning_rate"]["classifier"],
+                },
+                {
+                    "params": self.latent_model.generator.parameters(),
+                    "lr": self.config["train"]["learning_rate"]["generator"],
+                },
+            ],
+            betas=(0.5, 0.999),
+        )
+
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=self.config['train']['n_epochs'] * len(data_loader),
-            eta_min=self.config['train']['learning_rate']['min']
+            T_max=self.config["train"]["n_epochs"] * len(data_loader),
+            eta_min=self.config["train"]["learning_rate"]["min"],
         )
-        
+
         self.latent_model.to(self.device)
         self.reconstruction_loss.to(self.device)
-        
+
         summary = SummaryWriter(log_dir=tensorboard_dir)
-        for epoch in range(self.config['train']['n_epochs'] + 1):
+
+        best_metric = float("inf")
+        best_epoch = -1
+        epochs_without_improvement = 0
+        best_weights_path = os.path.join(model_dir, "latent_best.pth")
+
+        for epoch in range(self.config["train"]["n_epochs"] + 1):
             self.latent_model.train()
-            
+
             pbar = tqdm(iterable=data_loader)
-            iterator_labeled = iter(data_loader_labeled)
-            
+            iterator_labeled = (
+                iter(data_loader_labeled) if data_loader_labeled is not None else None
+            )
+
+            epoch_train_loss_sum = 0.0
+            epoch_train_n = 0
+
             for batch in pbar:
                 batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
-                
+
                 losses_unsupervised = self.__iterate_latent_model(batch)
                 loss_unsupervised = 0
                 for term, val in losses_unsupervised.items():
-                    if term == 'entropy' and epoch < self.config['train']['n_epochs_before_entropy']:
+                    if (
+                        term == "entropy"
+                        and epoch < self.config["train"]["n_epochs_before_entropy"]
+                    ):
                         continue
-                    
-                    loss_unsupervised += self.config['train']['loss_weights'][term] * val
-                
-                try:
-                    batch_labeled = next(iterator_labeled)
-                except StopIteration:
-                    iterator_labeled = iter(data_loader_labeled)
-                    batch_labeled = next(iterator_labeled)
-                
-                batch_labeled = {name: tensor.to(self.device) for name, tensor in batch_labeled.items()}
-                
-                losses_supervised = self.__iterate_latent_model_with_labels(batch_labeled)
-                loss_supervised = 0
-                for term, val in losses_supervised.items():
-                    loss_supervised += self.config['train']['loss_weights'][term] * val
-                
-                loss = loss_unsupervised + self.config['train']['loss_weights']['supervised'] * loss_supervised
-                
+
+                    loss_unsupervised += (
+                        self.config["train"]["loss_weights"][term] * val
+                    )
+
+                if data_loader_labeled is not None:
+                    try:
+                        batch_labeled = next(iterator_labeled)
+                    except StopIteration:
+                        iterator_labeled = iter(data_loader_labeled)
+                        batch_labeled = next(iterator_labeled)
+
+                    batch_labeled = {
+                        name: tensor.to(self.device)
+                        for name, tensor in batch_labeled.items()
+                    }
+
+                    losses_supervised = self.__iterate_latent_model_with_labels(
+                        batch_labeled
+                    )
+                    loss_supervised = 0
+                    for term, val in losses_supervised.items():
+                        loss_supervised += (
+                            self.config["train"]["loss_weights"][term] * val
+                        )
+                else:
+                    losses_supervised = {}
+                    loss_supervised = torch.tensor(0.0, device=self.device)
+
+                loss = (
+                    loss_unsupervised
+                    + self.config["train"]["loss_weights"]["supervised"]
+                    * loss_supervised
+                )
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
-                
-                pbar.set_description_str('[disentanglement] epoch #{}'.format(epoch))
+
+                batch_size = int(batch["counts_norm"].shape[0])
+                epoch_train_loss_sum += float(loss.detach().item()) * batch_size
+                epoch_train_n += batch_size
+
+                pbar.set_description_str("[disentanglement] epoch #{}".format(epoch))
                 pbar.set_postfix(loss=loss.item())
-            
+
             pbar.close()
-            
-            summary.add_scalar(tag='loss/total', scalar_value=loss.item(), global_step=epoch)
-            summary.add_scalar(tag='loss/unsupervised', scalar_value=loss_unsupervised.item(), global_step=epoch)
-            summary.add_scalar(tag='loss/supervised', scalar_value=loss_supervised.item(), global_step=epoch)
-            
+
+            train_loss_mean = epoch_train_loss_sum / max(epoch_train_n, 1)
+
+            summary.add_scalar(
+                tag="loss/total", scalar_value=train_loss_mean, global_step=epoch
+            )
+            summary.add_scalar(
+                tag="loss/unsupervised",
+                scalar_value=loss_unsupervised.item(),
+                global_step=epoch,
+            )
+            summary.add_scalar(
+                tag="loss/supervised",
+                scalar_value=loss_supervised.item(),
+                global_step=epoch,
+            )
+
             for term, val in losses_unsupervised.items():
-                summary.add_scalar(tag='loss/unsupervised/{}'.format(term), scalar_value=val.item(), global_step=epoch)
-            
+                summary.add_scalar(
+                    tag="loss/unsupervised/{}".format(term),
+                    scalar_value=val.item(),
+                    global_step=epoch,
+                )
+
             for term, val in losses_supervised.items():
-                summary.add_scalar(tag='loss/supervised/{}'.format(term), scalar_value=val.item(), global_step=epoch)
-            
+                summary.add_scalar(
+                    tag="loss/supervised/{}".format(term),
+                    scalar_value=val.item(),
+                    global_step=epoch,
+                )
+
             # if epoch % self.config['train']['n_epochs_between_evals'] == 0 and self.config['gt_labels']:
             #     latent_factors = self.__embed_factors(dataset)
             #     scores = dci.evaluate(latent_factors, factors)
-                
+
             #     summary.add_scalar(tag='dci/informativeness', scalar_value=scores['informativeness_test'], global_step=epoch)
             #     summary.add_scalar(tag='dci/disentanglement', scalar_value=scores['disentanglement'], global_step=epoch)
             #     summary.add_scalar(tag='dci/completeness', scalar_value=scores['completeness'], global_step=epoch)
-                
+
             #     for factor_idx, factor_name in enumerate(self.config['factor_names']):
             #         acc = self.__eval_factor_classification(counts_norm, factors, factor_idx)
             #         summary.add_scalar(tag='factors/{}'.format(factor_name), scalar_value=acc, global_step=epoch)
-                
+
             #     latent_residuals = self.__embed_residuals(dataset)
             #     for factor_idx, factor_name in enumerate(self.config['factor_names']):
             #         acc_train, acc_test = classifier.logistic_regression(latent_residuals, factors[:, factor_idx])
             #         summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
-                
-                # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
-                #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
-                #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
-            
+
+            # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
+            #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
+            #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
+
             # if epoch % self.config['train']['n_epochs_between_visualizations'] == 0:
             #     figure = self.__visualize_reconstruction(dataset)
             #     summary.add_image(tag='reconstruction', img_tensor=figure, global_step=epoch)
-                
+
             #     for factor_idx, factor_name in enumerate(self.config['factor_names']):
             #         figure_fixed = self.__visualize_translation(dataset, factor_idx, randomized=False)
             #         figure_random = self.__visualize_translation(dataset, factor_idx, randomized=True)
 
             #         summary.add_image(tag='{}-fixed'.format(factor_name), img_tensor=figure_fixed, global_step=epoch)
             #         summary.add_image(tag='{}-random'.format(factor_name), img_tensor=figure_random, global_step=epoch)
-            
+
             self.save(model_dir)
-        
+
+            # Early stopping (optional)
+            if early_stopping_enabled:
+                metric_name = "train_loss"
+                metric_value = train_loss_mean
+
+                if data_loader_val is not None:
+                    self.latent_model.eval()
+                    val_loss_sum = 0.0
+                    val_n = 0
+                    with torch.no_grad():
+                        for batch_val in data_loader_val:
+                            batch_val = {
+                                name: tensor.to(self.device)
+                                for name, tensor in batch_val.items()
+                            }
+
+                            losses_unsupervised_val = self.__iterate_latent_model(
+                                batch_val
+                            )
+                            loss_unsupervised_val = 0
+                            for term, val in losses_unsupervised_val.items():
+                                if (
+                                    term == "entropy"
+                                    and epoch
+                                    < self.config["train"]["n_epochs_before_entropy"]
+                                ):
+                                    continue
+                                loss_unsupervised_val += (
+                                    self.config["train"]["loss_weights"][term] * val
+                                )
+
+                            losses_supervised_val = (
+                                self.__iterate_latent_model_with_labels(batch_val)
+                            )
+                            loss_supervised_val = 0
+                            for term, val in losses_supervised_val.items():
+                                loss_supervised_val += (
+                                    self.config["train"]["loss_weights"][term] * val
+                                )
+
+                            loss_val = (
+                                loss_unsupervised_val
+                                + self.config["train"]["loss_weights"]["supervised"]
+                                * loss_supervised_val
+                            )
+
+                            bs = int(batch_val["counts_norm"].shape[0])
+                            val_loss_sum += float(loss_val.detach().item()) * bs
+                            val_n += bs
+
+                    metric_name = "val_loss"
+                    metric_value = val_loss_sum / max(val_n, 1)
+                    summary.add_scalar(
+                        tag="loss/val_total",
+                        scalar_value=metric_value,
+                        global_step=epoch,
+                    )
+
+                summary.add_scalar(
+                    tag="early_stopping/metric",
+                    scalar_value=metric_value,
+                    global_step=epoch,
+                )
+
+                improved = (best_metric - metric_value) > early_stopping_min_delta
+                if improved:
+                    best_metric = metric_value
+                    best_epoch = epoch
+                    epochs_without_improvement = 0
+                    torch.save(self.latent_model.state_dict(), best_weights_path)
+                else:
+                    epochs_without_improvement += 1
+
+                summary.add_scalar(
+                    tag="early_stopping/best_metric",
+                    scalar_value=best_metric,
+                    global_step=epoch,
+                )
+                summary.add_scalar(
+                    tag="early_stopping/epochs_without_improvement",
+                    scalar_value=epochs_without_improvement,
+                    global_step=epoch,
+                )
+
+                if epochs_without_improvement >= early_stopping_patience:
+                    if os.path.exists(best_weights_path):
+                        self.latent_model.load_state_dict(
+                            torch.load(best_weights_path, map_location=self.device)
+                        )
+                        self.save(model_dir)
+                    print(
+                        f"[early_stopping] stop at epoch={epoch} best_epoch={best_epoch} best_{metric_name}={best_metric:.6f}"
+                    )
+                    break
+
         summary.close()
 
-    def warmup_amortized_model(self, counts_norm, factors, label_masks, model_dir, tensorboard_dir):
+    def warmup_amortized_model(
+        self, counts_norm, factors, label_masks, model_dir, tensorboard_dir
+    ):
         self.amortized_model = AmortizedModel(self.config)
-        self.amortized_model.factor_model.load_state_dict(self.latent_model.factor_model.state_dict())
-        self.amortized_model.generator.load_state_dict(self.latent_model.generator.state_dict())
+        self.amortized_model.factor_model.load_state_dict(
+            self.latent_model.factor_model.state_dict()
+        )
+        self.amortized_model.generator.load_state_dict(
+            self.latent_model.generator.state_dict()
+        )
 
         data = dict(
             counts_norm=torch.from_numpy(counts_norm).to(torch.float32),
             counts_norm_id=torch.from_numpy(np.arange(counts_norm.shape[0])),
             factors=torch.from_numpy(factors.astype(np.int64)),
-            label_masks=torch.from_numpy(label_masks.astype(bool))
+            label_masks=torch.from_numpy(label_masks.astype(bool)),
         )
-        
+
         dataset = CustomDataset(data)
         data_loader = DataLoader(
-            dataset, batch_size=self.config['train']['batch_size'],
-            shuffle=True, pin_memory=True, drop_last=False
+            dataset,
+            batch_size=self.config["train"]["batch_size"],
+            shuffle=True,
+            pin_memory=True,
+            drop_last=False,
         )
 
         optimizer = Adam(
             params=self.amortized_model.residual_encoder.parameters(),
-            lr=self.config['amortization']['learning_rate']['max']
+            lr=self.config["amortization"]["learning_rate"]["max"],
         )
 
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=self.config['amortization']['n_epochs'] * len(data_loader),
-            eta_min=self.config['amortization']['learning_rate']['min']
+            T_max=self.config["amortization"]["n_epochs"] * len(data_loader),
+            eta_min=self.config["amortization"]["learning_rate"]["min"],
         )
 
         self.latent_model.to(self.device)
@@ -394,7 +648,7 @@ class Model:
         os.mkdir(tensorboard_dir)
         summary = SummaryWriter(log_dir=tensorboard_dir)
 
-        for epoch in range(self.config['amortization']['n_epochs'] + 1):
+        for epoch in range(self.config["amortization"]["n_epochs"] + 1):
             self.latent_model.train()
             self.amortized_model.train()
 
@@ -412,15 +666,21 @@ class Model:
                 optimizer.step()
                 scheduler.step()
 
-                pbar.set_description_str('[amortization] epoch #{}'.format(epoch))
+                pbar.set_description_str("[amortization] epoch #{}".format(epoch))
                 pbar.set_postfix(loss=loss_total.item())
 
             pbar.close()
 
-            summary.add_scalar(tag='loss/encoders', scalar_value=loss_total.item(), global_step=epoch)
+            summary.add_scalar(
+                tag="loss/encoders", scalar_value=loss_total.item(), global_step=epoch
+            )
 
             for term, loss in losses.items():
-                summary.add_scalar(tag='loss/encoders/{}'.format(term), scalar_value=loss.item(), global_step=epoch)
+                summary.add_scalar(
+                    tag="loss/encoders/{}".format(term),
+                    scalar_value=loss.item(),
+                    global_step=epoch,
+                )
 
             # if epoch % self.config['amortization']['n_epochs_between_evals'] == 0 and self.config['gt_labels']:
             #     latent_factors = self.__encode_factors(counts_norm)
@@ -435,9 +695,9 @@ class Model:
             #         acc_train, acc_test = classifier.logistic_regression(latent_residuals, factors[:, factor_idx])
             #         summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
 
-                # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
-                #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
-                #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
+            # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
+            #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
+            #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
 
             # if epoch % self.config['amortization']['n_epochs_between_visualizations'] == 0:
             #     figure = self.__visualize_reconstruction(dataset, amortized=True)
@@ -454,35 +714,39 @@ class Model:
 
         summary.close()
 
-    def tune_amortized_model(self, counts_norm, factors, label_masks, model_dir, tensorboard_dir):
+    def tune_amortized_model(
+        self, counts_norm, factors, label_masks, model_dir, tensorboard_dir
+    ):
         data = dict(
             counts_norm=torch.from_numpy(counts_norm).to(torch.float32),
             counts_norm_id=torch.from_numpy(np.arange(counts_norm.shape[0])),
             factors=torch.from_numpy(factors.astype(np.int64)),
-            label_masks=torch.from_numpy(label_masks.astype(bool))
+            label_masks=torch.from_numpy(label_masks.astype(bool)),
         )
-        
+
         dataset = CustomDataset(data)
         data_loader = DataLoader(
-            dataset, batch_size=self.config['train']['batch_size'],
-            shuffle=True, pin_memory=True, drop_last=False
+            dataset,
+            batch_size=self.config["train"]["batch_size"],
+            shuffle=True,
+            pin_memory=True,
+            drop_last=False,
         )
 
         generator_optimizer = Adam(
             params=itertools.chain(
                 self.amortized_model.residual_encoder.parameters(),
-                self.amortized_model.generator.parameters()
+                self.amortized_model.generator.parameters(),
             ),
-
-            lr=self.config['synthesis']['learning_rate']['generator'],
-            betas=(0.5, 0.999)
+            lr=self.config["synthesis"]["learning_rate"]["generator"],
+            betas=(0.5, 0.999),
         )
 
-        if self.config['synthesis']['adversarial']:
+        if self.config["synthesis"]["adversarial"]:
             discriminator_optimizer = Adam(
                 params=self.amortized_model.discriminator.parameters(),
-                lr=self.config['synthesis']['learning_rate']['discriminator'],
-                betas=(0.5, 0.999)
+                lr=self.config["synthesis"]["learning_rate"]["discriminator"],
+                betas=(0.5, 0.999),
             )
 
         self.latent_model.to(self.device)
@@ -492,7 +756,7 @@ class Model:
         os.mkdir(tensorboard_dir)
         summary = SummaryWriter(log_dir=tensorboard_dir)
 
-        for epoch in range(self.config['synthesis']['n_epochs'] + 1):
+        for epoch in range(self.config["synthesis"]["n_epochs"] + 1):
             self.latent_model.train()
             self.amortized_model.train()
 
@@ -500,12 +764,12 @@ class Model:
             for batch in pbar:
                 batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
 
-                if self.config['synthesis']['adversarial']:
+                if self.config["synthesis"]["adversarial"]:
                     losses_discriminator = self.__iterate_discriminator(batch)
                     loss_discriminator = (
-                        losses_discriminator['fake']
-                        + losses_discriminator['real']
-                        + losses_discriminator['gradient_penalty']
+                        losses_discriminator["fake"]
+                        + losses_discriminator["real"]
+                        + losses_discriminator["gradient_penalty"]
                     )
 
                     generator_optimizer.zero_grad()
@@ -516,26 +780,40 @@ class Model:
                 losses_generator = self.__iterate_amortized_model(batch)
                 loss_generator = 0
                 for term, loss in losses_generator.items():
-                    loss_generator += self.config['synthesis']['loss_weights'][term] * loss
+                    loss_generator += (
+                        self.config["synthesis"]["loss_weights"][term] * loss
+                    )
 
                 generator_optimizer.zero_grad()
-                if self.config['synthesis']['adversarial']:
+                if self.config["synthesis"]["adversarial"]:
                     discriminator_optimizer.zero_grad()
 
                 loss_generator.backward()
                 generator_optimizer.step()
 
-                pbar.set_description_str('[synthesis] epoch #{}'.format(epoch))
+                pbar.set_description_str("[synthesis] epoch #{}".format(epoch))
                 pbar.set_postfix(gen_loss=loss_generator.item())
 
             pbar.close()
 
-            summary.add_scalar(tag='loss/generator', scalar_value=loss_generator.item(), global_step=epoch)
-            if self.config['synthesis']['adversarial']:
-                summary.add_scalar(tag='loss/discriminator', scalar_value=loss_discriminator.item(), global_step=epoch)
+            summary.add_scalar(
+                tag="loss/generator",
+                scalar_value=loss_generator.item(),
+                global_step=epoch,
+            )
+            if self.config["synthesis"]["adversarial"]:
+                summary.add_scalar(
+                    tag="loss/discriminator",
+                    scalar_value=loss_discriminator.item(),
+                    global_step=epoch,
+                )
 
             for term, loss in losses_generator.items():
-                summary.add_scalar(tag='loss/generator/{}'.format(term), scalar_value=loss.item(), global_step=epoch)
+                summary.add_scalar(
+                    tag="loss/generator/{}".format(term),
+                    scalar_value=loss.item(),
+                    global_step=epoch,
+                )
 
             # if epoch % self.config['synthesis']['n_epochs_between_evals'] == 0 and self.config['gt_labels']:
             #     latent_residuals = self.__encode_residuals(counts_norm)
@@ -543,9 +821,9 @@ class Model:
             #         acc_train, acc_test = classifier.logistic_regression(latent_residuals, factors[:, factor_idx])
             #         summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
 
-                # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
-                #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
-                #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
+            # for factor_idx, factor_name in enumerate(self.config['residual_factor_names']):
+            #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, factor_idx])
+            #     summary.add_scalar(tag='residual/to-{}'.format(factor_name), scalar_value=acc_test, global_step=epoch)
 
             # if epoch % self.config['synthesis']['n_epochs_between_visualizations'] == 0:
             #     figure = self.__visualize_reconstruction(dataset, amortized=True)
@@ -567,35 +845,39 @@ class Model:
         latent_factors = self.__encode_factors(counts_norm)
 
         scores = dci.evaluate(latent_factors, factors)
-        with open(os.path.join(eval_dir, 'dci.json'), 'w') as fp:
+        with open(os.path.join(eval_dir, "dci.json"), "w") as fp:
             json.dump(scores, fp)
 
         scores = sap.evaluate(latent_factors, factors)
-        with open(os.path.join(eval_dir, 'sap.json'), 'w') as fp:
+        with open(os.path.join(eval_dir, "sap.json"), "w") as fp:
             json.dump(scores, fp)
 
         scores = mig.evaluate(latent_factors, factors)
-        with open(os.path.join(eval_dir, 'mig.json'), 'w') as fp:
+        with open(os.path.join(eval_dir, "mig.json"), "w") as fp:
             json.dump(scores, fp)
 
         scores = {}
-        for f, factor_name in enumerate(self.config['factor_names']):
-            scores[factor_name] = self.__eval_factor_classification(counts_norm, factors, f)
+        for f, factor_name in enumerate(self.config["factor_names"]):
+            scores[factor_name] = self.__eval_factor_classification(
+                counts_norm, factors, f
+            )
 
-        with open(os.path.join(eval_dir, 'factors.json'), 'w') as fp:
+        with open(os.path.join(eval_dir, "factors.json"), "w") as fp:
             json.dump(scores, fp)
 
         latent_residuals = self.__encode_residuals(counts_norm)
         scores = {}
-        for f, factor_name in enumerate(self.config['factor_names']):
-            acc_train, acc_test = classifier.logistic_regression(latent_residuals, factors[:, f])
+        for f, factor_name in enumerate(self.config["factor_names"]):
+            acc_train, acc_test = classifier.logistic_regression(
+                latent_residuals, factors[:, f]
+            )
             scores[factor_name] = acc_test
 
         # for f, factor_name in enumerate(self.config['residual_factor_names']):
         #     acc_train, acc_test = classifier.logistic_regression(latent_residuals, residual_factors[:, f])
         #     scores[factor_name] = acc_test
 
-        with open(os.path.join(eval_dir, 'residual.json'), 'w') as fp:
+        with open(os.path.join(eval_dir, "residual.json"), "w") as fp:
             json.dump(scores, fp)
 
     @torch.no_grad()
@@ -605,137 +887,174 @@ class Model:
 
         results = [img]
 
-        img = torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1).to(self.device)
+        img = (
+            torch.from_numpy(img.astype(np.float32) / 255.0)
+            .permute(2, 0, 1)
+            .to(self.device)
+        )
         residual_code = self.amortized_model.residual_encoder(img.unsqueeze(dim=0))[0]
 
-        factor_idx = self.config['factor_names'].index(factor_name)
-        factor_codes = self.amortized_model.factor_model(img.unsqueeze(dim=0))['factor_codes'][0]
+        factor_idx = self.config["factor_names"].index(factor_name)
+        factor_codes = self.amortized_model.factor_model(img.unsqueeze(dim=0))[
+            "factor_codes"
+        ][0]
 
-        factor_codes = list(torch.split(factor_codes, split_size_or_sections=self.config['factor_dim'], dim=0))
-        factor_values = torch.arange(self.config['factor_sizes'][factor_idx], dtype=torch.int64).to(self.device)
-        factor_embeddings = self.amortized_model.factor_model.module.factor_embeddings[factor_idx](factor_values)
+        factor_codes = list(
+            torch.split(
+                factor_codes, split_size_or_sections=self.config["factor_dim"], dim=0
+            )
+        )
+        factor_values = torch.arange(
+            self.config["factor_sizes"][factor_idx], dtype=torch.int64
+        ).to(self.device)
+        factor_embeddings = self.amortized_model.factor_model.module.factor_embeddings[
+            factor_idx
+        ](factor_values)
 
         for v in range(factor_embeddings.shape[0]):
             factor_codes[factor_idx] = factor_embeddings[v]
             latent_code = torch.cat(factor_codes + [residual_code], dim=0)
-            img_manipulated = self.amortized_model.generator(latent_code.unsqueeze(dim=0))[0]
-            img_manipulated = (img_manipulated.clamp(min=0, max=1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img_manipulated = self.amortized_model.generator(
+                latent_code.unsqueeze(dim=0)
+            )[0]
+            img_manipulated = (
+                img_manipulated.clamp(min=0, max=1).permute(1, 2, 0).cpu().numpy() * 255
+            ).astype(np.uint8)
             results.append(img_manipulated)
 
         return np.concatenate(results, axis=1)
-    
+
     def __iterate_latent_model(self, batch):
-        factor_model_out = self.latent_model.factor_model(batch['counts_norm'], batch['factors'], batch['label_masks'])
-        residual_code = self.latent_model.residual_embeddings(batch['counts_norm_id'])
-        
-        if self.config['residual_std'] != 0:
+        factor_model_out = self.latent_model.factor_model(
+            batch["counts_norm"], batch["factors"], batch["label_masks"]
+        )
+        residual_code = self.latent_model.residual_embeddings(batch["counts_norm_id"])
+
+        if self.config["residual_std"] != 0:
             noise = torch.zeros_like(residual_code)
-            noise.normal_(mean=0, std=self.config['residual_std'])
-            
+            noise.normal_(mean=0, std=self.config["residual_std"])
+
             residual_code_regularized = residual_code + noise
         else:
             residual_code_regularized = residual_code
-        
-        latent_code_regularized = torch.cat((factor_model_out['factor_codes'], residual_code_regularized), dim=1)
+
+        latent_code_regularized = torch.cat(
+            (factor_model_out["factor_codes"], residual_code_regularized), dim=1
+        )
         counts_norm_reconstructed = self.latent_model.generator(latent_code_regularized)
-        loss_reconstruction = self.reconstruction_loss(counts_norm_reconstructed, batch['counts_norm'])
-        
-        loss_entropy = factor_model_out['assignment_entropy'].mean()
-        loss_residual_decay = torch.mean(residual_code ** 2, dim=1).mean()
-        
+        loss_reconstruction = self.reconstruction_loss(
+            counts_norm_reconstructed, batch["counts_norm"]
+        )
+
+        loss_entropy = factor_model_out["assignment_entropy"].mean()
+        loss_residual_decay = torch.mean(residual_code**2, dim=1).mean()
+
         return {
-            'reconstruction': loss_reconstruction,
-            'residual_decay': loss_residual_decay,
-            'entropy': loss_entropy
+            "reconstruction": loss_reconstruction,
+            "residual_decay": loss_residual_decay,
+            "entropy": loss_entropy,
         }
-    
+
     def __iterate_latent_model_with_labels(self, batch):
-        factor_model_out = self.latent_model.factor_model(batch['counts_norm'], batch['factors'], batch['label_masks'])
-        residual_code = self.latent_model.residual_embeddings(batch['counts_norm_id'])
-        
-        if self.config['residual_std'] != 0:
+        factor_model_out = self.latent_model.factor_model(
+            batch["counts_norm"], batch["factors"], batch["label_masks"]
+        )
+        residual_code = self.latent_model.residual_embeddings(batch["counts_norm_id"])
+
+        if self.config["residual_std"] != 0:
             noise = torch.zeros_like(residual_code)
-            noise.normal_(mean=0, std=self.config['residual_std'])
-            
+            noise.normal_(mean=0, std=self.config["residual_std"])
+
             residual_code_regularized = residual_code + noise
         else:
             residual_code_regularized = residual_code
-        
-        latent_code_regularized = torch.cat((factor_model_out['factor_codes'], residual_code_regularized), dim=1)
+
+        latent_code_regularized = torch.cat(
+            (factor_model_out["factor_codes"], residual_code_regularized), dim=1
+        )
         counts_norm_reconstructed = self.latent_model.generator(latent_code_regularized)
-        loss_reconstruction = self.reconstruction_loss(counts_norm_reconstructed, batch['counts_norm'])
-        
+        loss_reconstruction = self.reconstruction_loss(
+            counts_norm_reconstructed, batch["counts_norm"]
+        )
+
         loss_classification = 0
-        for f in range(self.config['n_factors']):
-            if batch['label_masks'][:, f].any():
+        for f in range(self.config["n_factors"]):
+            if batch["label_masks"][:, f].any():
                 loss_classification += self.classification_loss(
-                    factor_model_out['assignment_logits_{}'.format(f)][batch['label_masks'][:, f]],
-                    batch['factors'][batch['label_masks'][:, f], f]
+                    factor_model_out["assignment_logits_{}".format(f)][
+                        batch["label_masks"][:, f]
+                    ],
+                    batch["factors"][batch["label_masks"][:, f], f],
                 )
-        
-        loss_residual_decay = torch.mean(residual_code ** 2, dim=1).mean()
-        
+
+        loss_residual_decay = torch.mean(residual_code**2, dim=1).mean()
+
         return {
-            'reconstruction': loss_reconstruction,
-            'residual_decay': loss_residual_decay,
-            'classification': loss_classification
+            "reconstruction": loss_reconstruction,
+            "residual_decay": loss_residual_decay,
+            "classification": loss_classification,
         }
 
     def __iterate_encoders(self, batch):
-        residual_code_target = self.latent_model.residual_embeddings(batch['counts_norm_id'])
-        residual_code = self.amortized_model.residual_encoder(batch['counts_norm'])
-        loss_residual = torch.mean((residual_code - residual_code_target) ** 2, dim=1).mean()
+        residual_code_target = self.latent_model.residual_embeddings(
+            batch["counts_norm_id"]
+        )
+        residual_code = self.amortized_model.residual_encoder(batch["counts_norm"])
+        loss_residual = torch.mean(
+            (residual_code - residual_code_target) ** 2, dim=1
+        ).mean()
 
-        return {
-            'residual': loss_residual
-        }
+        return {"residual": loss_residual}
 
     def __iterate_amortized_model(self, batch):
         with torch.no_grad():
-            factor_codes = self.amortized_model.factor_model(batch['counts_norm'])['factor_codes']
-            residual_code_target = self.latent_model.residual_embeddings(batch['counts_norm_id'])
+            factor_codes = self.amortized_model.factor_model(batch["counts_norm"])[
+                "factor_codes"
+            ]
+            residual_code_target = self.latent_model.residual_embeddings(
+                batch["counts_norm_id"]
+            )
 
-        residual_code = self.amortized_model.residual_encoder(batch['counts_norm'])
+        residual_code = self.amortized_model.residual_encoder(batch["counts_norm"])
 
         latent_code = torch.cat((factor_codes, residual_code), dim=1)
         img_reconstructed = self.amortized_model.generator(latent_code)
-        loss_reconstruction = self.reconstruction_loss(img_reconstructed, batch['counts_norm'])
+        loss_reconstruction = self.reconstruction_loss(
+            img_reconstructed, batch["counts_norm"]
+        )
 
-        loss_residual = torch.mean((residual_code - residual_code_target) ** 2, dim=1).mean()
+        loss_residual = torch.mean(
+            (residual_code - residual_code_target) ** 2, dim=1
+        ).mean()
 
-        losses = {
-            'reconstruction': loss_reconstruction,
-            'latent': loss_residual
-        }
+        losses = {"reconstruction": loss_reconstruction, "latent": loss_residual}
 
-        if self.config['synthesis']['adversarial']:
+        if self.config["synthesis"]["adversarial"]:
             discriminator_fake = self.amortized_model.discriminator(img_reconstructed)
             loss_adversarial = self.__adv_loss(discriminator_fake, 1)
 
-            losses['adversarial'] = loss_adversarial
+            losses["adversarial"] = loss_adversarial
 
         return losses
 
     def __iterate_discriminator(self, batch):
         with torch.no_grad():
-            factor_codes = self.amortized_model.factor_model(batch['counts_norm'])['factor_codes']
-            residual_code = self.amortized_model.residual_encoder(batch['counts_norm'])
+            factor_codes = self.amortized_model.factor_model(batch["counts_norm"])[
+                "factor_codes"
+            ]
+            residual_code = self.amortized_model.residual_encoder(batch["counts_norm"])
             latent_code = torch.cat((factor_codes, residual_code), dim=1)
             img_reconstructed = self.amortized_model.generator(latent_code)
 
-        batch['counts_norm'].requires_grad_()  # for gradient penalty
+        batch["counts_norm"].requires_grad_()  # for gradient penalty
         discriminator_fake = self.amortized_model.discriminator(img_reconstructed)
-        discriminator_real = self.amortized_model.discriminator(batch['counts_norm'])
+        discriminator_real = self.amortized_model.discriminator(batch["counts_norm"])
 
         loss_fake = self.__adv_loss(discriminator_fake, 0)
         loss_real = self.__adv_loss(discriminator_real, 1)
-        loss_gp = self.__gradient_penalty(discriminator_real, batch['counts_norm'])
+        loss_gp = self.__gradient_penalty(discriminator_real, batch["counts_norm"])
 
-        return {
-            'fake': loss_fake,
-            'real': loss_real,
-            'gradient_penalty': loss_gp
-        }
+        return {"fake": loss_fake, "real": loss_real, "gradient_penalty": loss_gp}
 
     @staticmethod
     def __adv_loss(logits, target):
@@ -747,7 +1066,13 @@ class Model:
     def __gradient_penalty(d_out, x_in):
         batch_size = x_in.size(0)
 
-        grad_dout = torch.autograd.grad(outputs=d_out.sum(), inputs=x_in, create_graph=True, retain_graph=True, only_inputs=True)[0]
+        grad_dout = torch.autograd.grad(
+            outputs=d_out.sum(),
+            inputs=x_in,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
         grad_dout2 = grad_dout.pow(2)
 
         reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
@@ -758,40 +1083,58 @@ class Model:
         self.latent_model.eval()
 
         codes = []
-        data_loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False)
+        data_loader = DataLoader(
+            dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False
+        )
         for batch in data_loader:
             batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
 
-            batch_codes = self.latent_model.factor_model(batch['counts_norm'], batch['factors'], batch['label_masks'])['factor_codes']
+            batch_codes = self.latent_model.factor_model(
+                batch["counts_norm"], batch["factors"], batch["label_masks"]
+            )["factor_codes"]
             codes.append(batch_codes.cpu())
 
         codes = torch.cat(codes, dim=0)
-        return torch.stack(torch.split(codes, split_size_or_sections=self.config['factor_dim'], dim=1), dim=1).numpy()
+        return torch.stack(
+            torch.split(codes, split_size_or_sections=self.config["factor_dim"], dim=1),
+            dim=1,
+        ).numpy()
 
     @torch.no_grad()
     def __encode_factors(self, counts_norm):
         self.amortized_model.eval()
 
         codes = []
-        dataset = CustomDataset({'counts_norm': torch.from_numpy(counts_norm).to(torch.float32)})
-        data_loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False)
+        dataset = CustomDataset(
+            {"counts_norm": torch.from_numpy(counts_norm).to(torch.float32)}
+        )
+        data_loader = DataLoader(
+            dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False
+        )
         for batch in data_loader:
-            batch_codes = self.amortized_model.factor_model(batch['counts_norm'].to(self.device))['factor_codes']
+            batch_codes = self.amortized_model.factor_model(
+                batch["counts_norm"].to(self.device)
+            )["factor_codes"]
             codes.append(batch_codes.cpu())
 
         codes = torch.cat(codes, dim=0)
-        return torch.stack(torch.split(codes, split_size_or_sections=self.config['factor_dim'], dim=1), dim=1).numpy()
+        return torch.stack(
+            torch.split(codes, split_size_or_sections=self.config["factor_dim"], dim=1),
+            dim=1,
+        ).numpy()
 
     @torch.no_grad()
     def __embed_residuals(self, dataset):
         self.latent_model.eval()
 
         codes = []
-        data_loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False)
+        data_loader = DataLoader(
+            dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False
+        )
         for batch in data_loader:
             batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
 
-            batch_codes = self.latent_model.residual_embeddings(batch['counts_norm_id'])
+            batch_codes = self.latent_model.residual_embeddings(batch["counts_norm_id"])
             codes.append(batch_codes.cpu())
 
         codes = torch.cat(codes, dim=0)
@@ -802,10 +1145,16 @@ class Model:
         self.amortized_model.eval()
 
         codes = []
-        dataset = CustomDataset({'counts_norm': torch.from_numpy(counts_norm).to(torch.float32)})
-        data_loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False)
+        dataset = CustomDataset(
+            {"counts_norm": torch.from_numpy(counts_norm).to(torch.float32)}
+        )
+        data_loader = DataLoader(
+            dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False
+        )
         for batch in data_loader:
-            batch_codes = self.amortized_model.residual_encoder(batch['counts_norm'].to(self.device))
+            batch_codes = self.amortized_model.residual_encoder(
+                batch["counts_norm"].to(self.device)
+            )
             codes.append(batch_codes.cpu())
 
         codes = torch.cat(codes, dim=0)
@@ -815,15 +1164,26 @@ class Model:
     def __eval_factor_classification(self, counts_norm, factors, factor_idx):
         self.latent_model.eval()
 
-        dataset = CustomDataset({'counts_norm': torch.from_numpy(counts_norm).to(torch.float32)})
-        data_loader = DataLoader(dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False)
+        dataset = CustomDataset(
+            {"counts_norm": torch.from_numpy(counts_norm).to(torch.float32)}
+        )
+        data_loader = DataLoader(
+            dataset, batch_size=64, shuffle=False, pin_memory=True, drop_last=False
+        )
 
         predictions = []
         for batch in data_loader:
-            if isinstance(self.latent_model.factor_model.module.factor_classifiers, MultiFactorClassifier):
-                logits = self.latent_model.factor_model.module.factor_classifiers(batch['counts_norm'].to(self.device))[factor_idx]
+            if isinstance(
+                self.latent_model.factor_model.module.factor_classifiers,
+                MultiFactorClassifier,
+            ):
+                logits = self.latent_model.factor_model.module.factor_classifiers(
+                    batch["counts_norm"].to(self.device)
+                )[factor_idx]
             else:
-                logits = self.latent_model.factor_model.module.factor_classifiers[factor_idx](batch['counts_norm'].to(self.device))
+                logits = self.latent_model.factor_model.module.factor_classifiers[
+                    factor_idx
+                ](batch["counts_norm"].to(self.device))
 
             batch_predictions = logits.argmax(dim=1)
             predictions.append(batch_predictions.cpu().numpy())
@@ -834,37 +1194,67 @@ class Model:
         return accuracy
 
     @torch.no_grad()
-    def __visualize_translation(self, dataset, factor_idx, n_samples=10, randomized=False, amortized=False):
-        random = self.visualization_rs if randomized else np.random.RandomState(seed=self.config['seed'])
-        img_idx = torch.from_numpy(random.choice(len(dataset), size=n_samples, replace=False))
+    def __visualize_translation(
+        self, dataset, factor_idx, n_samples=10, randomized=False, amortized=False
+    ):
+        random = (
+            self.visualization_rs
+            if randomized
+            else np.random.RandomState(seed=self.config["seed"])
+        )
+        img_idx = torch.from_numpy(
+            random.choice(len(dataset), size=n_samples, replace=False)
+        )
         batch = dataset[img_idx]
         batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
 
         if amortized:
             self.amortized_model.eval()
 
-            batch['factor_codes'] = self.amortized_model.factor_model(batch['counts_norm'])['factor_codes']
-            batch['residual_code'] = self.amortized_model.residual_encoder(batch['counts_norm'])
+            batch["factor_codes"] = self.amortized_model.factor_model(
+                batch["counts_norm"]
+            )["factor_codes"]
+            batch["residual_code"] = self.amortized_model.residual_encoder(
+                batch["counts_norm"]
+            )
 
         else:
             self.latent_model.eval()
 
-            batch['factor_codes'] = self.latent_model.factor_model(batch['counts_norm'], batch['factors'], batch['label_masks'])['factor_codes']
-            batch['residual_code'] = self.latent_model.residual_embeddings(batch['counts_norm_id'])
+            batch["factor_codes"] = self.latent_model.factor_model(
+                batch["counts_norm"], batch["factors"], batch["label_masks"]
+            )["factor_codes"]
+            batch["residual_code"] = self.latent_model.residual_embeddings(
+                batch["counts_norm_id"]
+            )
 
-        generator = self.amortized_model.generator if amortized else self.latent_model.generator
+        generator = (
+            self.amortized_model.generator if amortized else self.latent_model.generator
+        )
 
         figure = []
         for i in range(n_samples):
-            converted_imgs = [batch['counts_norm'][i]]
+            converted_imgs = [batch["counts_norm"][i]]
 
-            factor_codes = list(torch.split(batch['factor_codes'][i], split_size_or_sections=self.config['factor_dim'], dim=0))
-            factor_values = torch.arange(self.config['factor_sizes'][factor_idx], dtype=torch.int64).to(self.device)
-            factor_embeddings = self.latent_model.factor_model.module.factor_embeddings[factor_idx](factor_values)
+            factor_codes = list(
+                torch.split(
+                    batch["factor_codes"][i],
+                    split_size_or_sections=self.config["factor_dim"],
+                    dim=0,
+                )
+            )
+            factor_values = torch.arange(
+                self.config["factor_sizes"][factor_idx], dtype=torch.int64
+            ).to(self.device)
+            factor_embeddings = self.latent_model.factor_model.module.factor_embeddings[
+                factor_idx
+            ](factor_values)
 
             for j in range(factor_embeddings.shape[0]):
                 factor_codes[factor_idx] = factor_embeddings[j]
-                latent_code = torch.cat(factor_codes + [batch['residual_code'][i]], dim=0)
+                latent_code = torch.cat(
+                    factor_codes + [batch["residual_code"][i]], dim=0
+                )
                 converted_img = generator(latent_code.unsqueeze(dim=0))
                 converted_imgs.append(converted_img[0])
 
@@ -875,31 +1265,46 @@ class Model:
 
     @torch.no_grad()
     def __visualize_reconstruction(self, dataset, n_samples=10, amortized=False):
-        random = np.random.RandomState(seed=self.config['seed'])
-        img_idx = torch.from_numpy(random.choice(len(dataset), size=n_samples, replace=False))
+        random = np.random.RandomState(seed=self.config["seed"])
+        img_idx = torch.from_numpy(
+            random.choice(len(dataset), size=n_samples, replace=False)
+        )
         batch = dataset[img_idx]
         batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
 
         if amortized:
             self.amortized_model.eval()
 
-            batch['factor_codes'] = self.amortized_model.factor_model(batch['counts_norm'])['factor_codes']
-            batch['residual_code'] = self.amortized_model.residual_encoder(batch['counts_norm'])
+            batch["factor_codes"] = self.amortized_model.factor_model(
+                batch["counts_norm"]
+            )["factor_codes"]
+            batch["residual_code"] = self.amortized_model.residual_encoder(
+                batch["counts_norm"]
+            )
 
         else:
             self.latent_model.eval()
 
-            batch['factor_codes'] = self.latent_model.factor_model(batch['counts_norm'], batch['factors'], batch['label_masks'])['factor_codes']
-            batch['residual_code'] = self.latent_model.residual_embeddings(batch['counts_norm_id'])
+            batch["factor_codes"] = self.latent_model.factor_model(
+                batch["counts_norm"], batch["factors"], batch["label_masks"]
+            )["factor_codes"]
+            batch["residual_code"] = self.latent_model.residual_embeddings(
+                batch["counts_norm_id"]
+            )
 
-        generator = self.amortized_model.generator if amortized else self.latent_model.generator
+        generator = (
+            self.amortized_model.generator if amortized else self.latent_model.generator
+        )
 
-        latent_code = torch.cat((batch['factor_codes'], batch['residual_code']), dim=1)
+        latent_code = torch.cat((batch["factor_codes"], batch["residual_code"]), dim=1)
         img_reconstructed = generator(latent_code)
 
-        figure = torch.cat([
-            torch.cat(list(batch['counts_norm']), dim=2),
-            torch.cat(list(img_reconstructed), dim=2)
-        ], dim=1)
+        figure = torch.cat(
+            [
+                torch.cat(list(batch["counts_norm"]), dim=2),
+                torch.cat(list(img_reconstructed), dim=2),
+            ],
+            dim=1,
+        )
 
         return figure.clamp(min=0, max=1)

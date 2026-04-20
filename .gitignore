@@ -1,0 +1,60 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python / notebooks
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments / build artifacts
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Project outputs
+data/
+results/
+log_dir/
+tmp/
+performance/**/*.csv
+performance/summary_tables/
+plot/figures/
+plot/line/
+plot/pdfs/
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+tensorboard/
+tb/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Runtime logs / scheduler leftovers
+*.log
+*.out
+*.pid
+
+# Secrets
+.env
+.env.*
